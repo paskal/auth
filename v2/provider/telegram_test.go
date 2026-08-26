@@ -1398,3 +1398,50 @@ func TestTelegram_AvatarDownloadRefusesARedirect(t *testing.T) {
 	require.NotEmpty(t, logged.String(), "the failure was not logged, so nothing here checks it")
 	assert.NotContains(t, logged.String(), token, "the logged error carried the bot token")
 }
+
+// TestTelegram_AvatarRequestBuildErrorDoesNotLeakTheToken covers the other error site in
+// saveTelegramAvatar. The download URL interpolates the file path the metadata response chose, so
+// with a configured base the whole tail is upstream's: a path carrying a malformed escape fails
+// url.Parse inside http.NewRequestWithContext, and the *url.Error prints the whole URL verbatim.
+//
+// A second copy of the token in that path has no "/bot<token>/" slashes around it, so shape-based
+// redaction leaves it in place. Only the token-aware layer removes it, which is why this site needs
+// the same pair as the fetch failure beside it.
+func TestTelegram_AvatarRequestBuildErrorDoesNotLeakTheToken(t *testing.T) {
+	const token = "1234567:SECRET-TOK_EN-x"
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/getUserProfilePhotos"):
+			fmt.Fprint(w, `{"ok":true,"result":{"photos":[[{"file_id":"pic1"}]]}}`)
+		case strings.Contains(r.URL.Path, "/getFile"):
+			// unparseable, and carrying a copy of the token outside any slash-delimited segment
+			fmt.Fprintf(w, `{"ok":true,"result":{"file_path":"photo%%zz?copy=%s"}}`, token)
+		default:
+			_, _ = w.Write([]byte("avatar-bytes"))
+		}
+	}))
+	defer ts.Close()
+
+	tg, err := NewTelegramAPIWithBaseURL(token, ts.Client(), ts.URL)
+	require.NoError(t, err)
+
+	var logged strings.Builder
+	saver := &mockContentSaver{}
+	th := TelegramHandler{
+		L: logger.Func(func(format string, args ...any) {
+			fmt.Fprintf(&logged, format+"\n", args...)
+		}),
+		ProviderName: "telegram", Telegram: tg, AvatarSaver: saver,
+	}
+
+	avatarURL, err := tg.Avatar(context.Background(), 1)
+	require.NoError(t, err)
+	require.Contains(t, avatarURL, "%zz", "the upstream file path did not reach the download url")
+
+	got := th.saveTelegramAvatar(context.Background(), "u1", avatarURL)
+
+	assert.Empty(t, got, "an unbuildable request produced an avatar")
+	require.NotEmpty(t, logged.String(), "the failure was not logged, so nothing here checks it")
+	assert.NotContains(t, logged.String(), token, "the logged error carried the bot token")
+}

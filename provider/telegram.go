@@ -732,7 +732,7 @@ func (th *TelegramHandler) saveTelegramAvatar(ctx context.Context, userID, avata
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, avatarURL, http.NoBody)
 	if err != nil {
-		th.Logf("[WARN] telegram avatar fetch request build failed: %v", redactBotURLInErr(err))
+		th.Logf("[WARN] telegram avatar fetch request build failed: %v", th.redactAvatarErr(err))
 		return ""
 	}
 	client := &http.Client{Timeout: 5 * time.Second}
