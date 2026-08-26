@@ -416,12 +416,10 @@ func NewTelegramAPIWithBaseURL(token string, client *http.Client, baseURL string
 		return nil, err
 	}
 
-	// rebuild from what was validated, so the string checked is the string used. Parsing accepts
-	// shapes the checks below see as empty while fmt.Sprintf does not: a trailing "?" sets
-	// ForceQuery with RawQuery empty, and would push the whole "/bot<token>/method" into the query
-	// string, which is the part logs and referrers capture most eagerly. A trailing "#" is the
-	// mirror image and would bury every request in a fragment that is never sent
-	u.ForceQuery = false
+	// rebuild from what was validated, so the string checked is the string used. A trailing "?" or
+	// "#" would push the whole "/bot<token>/method" into a query string or a fragment, which is the
+	// part logs and referrers capture most eagerly; validateTelegramBaseURL rejects both outright,
+	// so there is nothing left to repair here beyond the path's own trailing slash
 	u.Path = strings.TrimRight(u.Path, "/")
 
 	return &tgAPI{client: client, token: token, baseURL: u.String(), avatarClient: client}, nil
@@ -609,7 +607,10 @@ func (tg *tgAPI) redactToken(err error) error {
 	// recoverable from the text by any of those routes, the text goes rather than the token stays.
 	// A proxy echoing "%2Fbot1234%3ASECRET%2FgetMe" defeats every ReplaceAll above and lands here
 	if tokenRecoverable(msg, tg.token) {
-		return fmt.Errorf("unexpected telegram API error, text withheld because it carried the bot token")
+		// says what was established rather than what was found: two of tokenRecoverable's three
+		// true paths are "could not decide", so claiming the token was in the text would send an
+		// operator hunting a leak that a bare "%" in an ordinary API error is enough to fake
+		return errors.New("unexpected telegram API error, text withheld: the bot token could not be ruled out of it")
 	}
 
 	if msg == err.Error() {
@@ -631,13 +632,16 @@ func tokenRecoverable(msg, token string) bool {
 		}
 		next, err := neturl.QueryUnescape(seen)
 		if err != nil {
-			if next, err = neturl.PathUnescape(seen); err != nil {
-				// malformed escaping, so the text cannot be decoded and the token cannot be shown
-				// absent from it. One stray "%" in whatever the upstream echoed reaches here, and
-				// answering "not recoverable" would release a message that may still carry the
-				// token in an encoding this never got to undo
-				return true
-			}
+			// malformed escaping, so the text cannot be decoded and the token cannot be shown
+			// absent from it. One stray "%" in whatever the upstream echoed reaches here, and
+			// answering "not recoverable" would release a message that may still carry the token
+			// in an encoding this never got to undo.
+			//
+			// No PathUnescape fallback: both modes reach the same EscapeError check and differ
+			// only in whether "+" decodes to a space, which happens after validation, so a retry
+			// in the other mode fails on the same input and reads as a rescue route that is not
+			// there
+			return true
 		}
 		if next == seen {
 			// decoding has converged and the loop has already examined this form, so the token is
@@ -669,6 +673,26 @@ type telegramAvatarClientProvider interface {
 }
 
 func (tg *tgAPI) avatarHTTPClient() *http.Client { return tg.avatarClient }
+
+// telegramTokenRedactor is the optional capability that lets an error leaving the avatar path be
+// scrubbed of the bot token itself, rather than only of the URL shape the token usually travels in.
+type telegramTokenRedactor interface {
+	redactToken(err error) error
+}
+
+// redactAvatarErr scrubs an error before it reaches a log. Shape-based redaction is not enough on
+// its own here: when the redirect hook refuses a hop, net/http overwrites the *url.Error's URL with
+// the Location the upstream chose, so a proxy answering "302 Location: https://evil.tld/?t=<token>"
+// produces an error carrying the token with no "/bot<token>/" segment for the regex to match. The
+// file path in the metadata response is upstream-controlled in the same way. request() stacks both
+// layers for exactly this reason; the avatar path needs the same pair
+func (th *TelegramHandler) redactAvatarErr(err error) error {
+	err = redactBotURLInErr(err)
+	if redactor, ok := th.Telegram.(telegramTokenRedactor); ok {
+		return redactor.redactToken(err)
+	}
+	return err
+}
 
 // avatarContentSaver matches the optional method on AvatarSaver implementations
 // that can store already-fetched bytes (avatar.Proxy provides one). Used by the
@@ -727,7 +751,7 @@ func (th *TelegramHandler) saveTelegramAvatar(ctx context.Context, userID, avata
 	defer cancel()
 	resp, err := noRedirect(client).Do(req.WithContext(avatarCtx))
 	if err != nil {
-		th.Logf("[WARN] telegram avatar fetch failed: %v", redactBotURLInErr(err))
+		th.Logf("[WARN] telegram avatar fetch failed: %v", th.redactAvatarErr(err))
 		return ""
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -757,12 +781,6 @@ func (th *TelegramHandler) saveTelegramAvatar(ctx context.Context, userID, avata
 
 const maxTelegramAvatarSize = 10 << 20
 
-// botTokenInURLPath matches the bot-token segment of a Telegram URL anchored
-// between path slashes ("/botTOKEN/..."). The leading and trailing slashes
-// avoid matching unrelated identifiers that happen to start with "bot" (e.g.
-// the username "botFather" appearing elsewhere in a log line). Replacement
-// preserves the slashes via "/bot<redacted>/" to keep surrounding URL
-// structure intact for diagnostics.
 // noRedirect returns a client that refuses redirects, as the default for a caller who expressed no
 // policy of their own. Every URL here carries the bot token in its path, and Go copies the previous
 // URL into Referer on any hop that is not https-to-http, so following a redirect hands the
@@ -793,6 +811,12 @@ func noRedirect(c *http.Client) *http.Client {
 // telegramUsername is the shape Telegram allows: 5 to 32 of [A-Za-z0-9_]
 var telegramUsername = regexp.MustCompile(`^[A-Za-z0-9_]{5,32}$`)
 
+// botTokenInURLPath matches the bot-token segment of a Telegram URL anchored
+// between path slashes ("/botTOKEN/..."). The leading and trailing slashes
+// avoid matching unrelated identifiers that happen to start with "bot" (e.g.
+// the username "botFather" appearing elsewhere in a log line). Replacement
+// preserves the slashes via "/bot<redacted>/" to keep surrounding URL
+// structure intact for diagnostics.
 var botTokenInURLPath = regexp.MustCompile(`/bot[A-Za-z0-9:_-]+/`)
 
 // redactBotURLInErr returns the error with any embedded Telegram bot-token

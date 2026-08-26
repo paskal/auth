@@ -1007,9 +1007,15 @@ func TestTelegram_APIBaseURLRejectsUnusableValues(t *testing.T) {
 			require.Error(t, err, "%s has to be refused", base)
 
 			// the refusal is logged by whoever built the client, and the value it refused is
-			// untrusted configuration. Without this the six rejections could each interpolate
-			// the base back and stay green
-			assert.NotContains(t, err.Error(), base,
+			// untrusted configuration. Without this the rejections could each interpolate the
+			// base back and stay green.
+			//
+			// asserted against what validation actually sees rather than the literal above: the
+			// constructor trims trailing slashes first, so a value written with one can never
+			// appear in an error and the assertion would pass whatever the code did. That is what
+			// defanged the one entry here carrying a real password
+			seen := strings.TrimRight(base, "/")
+			assert.NotContains(t, err.Error(), seen,
 				"the rejection echoed the base url it refused")
 		})
 	}
@@ -1300,4 +1306,95 @@ func TestTelegram_RedirectPolicyOfTheCallerIsKept(t *testing.T) {
 	require.NoError(t, err, "the caller's policy was overridden by the refusal")
 	assert.Equal(t, "somebot", info.Username)
 	assert.Equal(t, 1, hookCalls, "the caller's CheckRedirect was not the hook that ran")
+}
+
+// TestTelegram_APIErrorWithheldWhenUndecidableWithoutAToken separates the two reasons the text can
+// be withheld. TestTelegram_APIErrorWithheldWhenEscapingIsMalformed puts a double-encoded token and
+// a bare "%" in one description, so it cannot tell "the token is in there" from "this could not be
+// decoded". Here the description carries no token at all, only the stray "%" that stops the decoder:
+// the text still has to be withheld, since nothing established the token is absent, and the message
+// has to say that rather than assert a leak that did not happen.
+func TestTelegram_APIErrorWithheldWhenUndecidableWithoutAToken(t *testing.T) {
+	const token = "1234567:SECRET-TOK_EN-x"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprint(w, `{"description":"Bad Request: server at 100% load"}`)
+	}))
+	defer srv.Close()
+
+	tg, err := NewTelegramAPIWithBaseURL(token, srv.Client(), srv.URL)
+	require.NoError(t, err)
+
+	_, err = tg.BotInfo(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "text withheld", "an undecodable description was released")
+	assert.NotContains(t, err.Error(), "carried the bot token",
+		"the message claims a leak that nothing here established")
+}
+
+// TestTelegram_AvatarDownloadRefusesARedirect covers the refusal on the path that carries the token
+// in a URL a third party is most likely to log. Deleting the noRedirect wrapper in
+// saveTelegramAvatar leaves every other case green: the two download tests serve 200s and never
+// redirect, and TestTelegram_APIDoesNotFollowRedirects drives request() through BotInfo instead.
+//
+// The error is also asserted not to carry the token. Refusing a hop makes net/http overwrite the
+// *url.Error's URL with the Location the upstream chose, so shape-based redaction alone finds no
+// "/bot<token>/" segment to remove and the token reaches the log.
+func TestTelegram_AvatarDownloadRefusesARedirect(t *testing.T) {
+	const token = "1234567:SECRET-TOK_EN-x"
+
+	var refererSeen, reached string
+	dest := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		refererSeen = r.Header.Get("Referer")
+		reached = r.URL.Path
+		_, _ = w.Write([]byte("avatar-bytes"))
+	}))
+	defer dest.Close()
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/getUserProfilePhotos"):
+			fmt.Fprint(w, `{"ok":true,"result":{"photos":[[{"file_id":"pic1"}]]}}`)
+		case strings.Contains(r.URL.Path, "/getFile"):
+			fmt.Fprint(w, `{"ok":true,"result":{"file_path":"photos/file_0.jpg"}}`)
+		default:
+			// the shape a proxy standing in for the file API can produce: the token is in the
+			// destination this names, not in a "/bot<token>/" segment
+			http.Redirect(w, r, dest.URL+"/leaked?t="+token, http.StatusFound)
+		}
+	}))
+	defer ts.Close()
+
+	client := ts.Client()
+	client.Transport = dest.Client().Transport // trusts both self-signed certs
+
+	tg, err := NewTelegramAPIWithBaseURL(token, client, ts.URL)
+	require.NoError(t, err)
+
+	saver := &mockContentSaver{}
+	// the real log line rather than the redaction helper called directly: asserting on the helper
+	// leaves the call site free to drop it and stay green, which is the shape this whole round was
+	// about
+	var logged strings.Builder
+	th := TelegramHandler{
+		L: logger.Func(func(format string, args ...any) {
+			fmt.Fprintf(&logged, format+"\n", args...)
+		}),
+		ProviderName: "telegram", Telegram: tg, AvatarSaver: saver,
+	}
+
+	avatarURL, err := tg.Avatar(context.Background(), 1)
+	require.NoError(t, err)
+
+	got := th.saveTelegramAvatar(context.Background(), "u1", avatarURL)
+
+	assert.Empty(t, got, "the redirect was followed and the avatar stored from the destination")
+	assert.Empty(t, reached, "the redirect destination was reached at %q", reached)
+	assert.Empty(t, refererSeen, "the destination saw Referer %q", refererSeen)
+	assert.Empty(t, saver.content, "bytes from the redirect destination were stored")
+
+	// the refusal error names the Location the upstream chose, which carries the token outside any
+	// "/bot<token>/" segment, so shape-based redaction alone leaves it in the line
+	require.NotEmpty(t, logged.String(), "the failure was not logged, so nothing here checks it")
+	assert.NotContains(t, logged.String(), token, "the logged error carried the bot token")
 }
